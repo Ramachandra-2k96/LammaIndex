@@ -90,9 +90,8 @@ def get_available_models():
 def initialize_llm(model_name):
     logger.info(f"Initializing LLM: {model_name}")
     try:
-        llm = Ollama(model=model_name, request_timeout=60.0)
+        llm = Ollama(model=model_name, request_timeout=6000)
         Settings.llm = llm
-        Settings.chunk_size = 1024
         Settings.embed_model = OllamaEmbedding(model_name="nomic-embed-text")
         logger.info(f"Successfully initialized model: {model_name}")
         return llm
