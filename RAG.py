@@ -14,7 +14,7 @@ from llama_index.core.extractors import TitleExtractor, QuestionsAnsweredExtract
 from llama_index.core.node_parser import TokenTextSplitter
 
 # 1. Initialize AI Model & Embeddings
-llm = Ollama(model="llama3.2")
+llm = Ollama(model="llama3.2",request_timeout=600)
 embed_model = OllamaEmbedding(model_name="nomic-embed-text")
 
 # 2. Set Global AI Settings
