@@ -48,7 +48,7 @@ if collection.count() == 0:
 
     # Load PDF documents from the 'test' directory
     documents = SimpleDirectoryReader(
-        input_dir="test",
+        input_dir="data",
         required_exts=[".pdf"],
         filename_as_id=True,
         recursive=True
