@@ -1,14 +1,23 @@
 import os
 import re
 import uuid
+import concurrent.futures  # For parallel processing
+from tqdm import tqdm       # Progress bar for better tracking
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.ollama import OllamaEmbedding
-from llama_index.core import Settings, SimpleDirectoryReader, VectorStoreIndex
-from llama_index.core.node_parser import TokenTextSplitter
+from llama_index.core import Settings, SimpleDirectoryReader, VectorStoreIndex, Document
+from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core.extractors import TitleExtractor, QuestionsAnsweredExtractor, SummaryExtractor, KeywordExtractor
 from llama_index.core.ingestion import IngestionPipeline
+from llama_index.core.chat_engine import CondensePlusContextChatEngine
 import chromadb
+
+# ANSI Color Codes for Terminal Output
+COLOR_USER = "\033[94m"     # Blue
+COLOR_AI = "\033[92m"       # Green
+COLOR_CITATION = "\033[93m" # Yellow
+COLOR_RESET = "\033[0m"     # Reset color
 
 # -------------------------
 # 1. Initialize AI Model & Embeddings
@@ -23,9 +32,12 @@ Settings.embed_model = embed_model
 # -------------------------
 # 2. Initialize ChromaDB Client and Collection
 # -------------------------
-chroma_client = chromadb.PersistentClient(path="./chroma_db_IonIdea")
+chroma_client = chromadb.PersistentClient(path="./chroma_db_IonIdea_batch")
+from llama_index.vector_stores.chroma import ChromaVectorStore
 collection_name = "document_knowledge_base"
 collection = chroma_client.get_or_create_collection(collection_name)
+# Wrap the ChromaDB collection in ChromaVectorStore
+vector_store = ChromaVectorStore(chroma_collection=collection)
 
 # -------------------------
 # 3. Initialize Chat Memory with Token Limit
@@ -33,25 +45,12 @@ collection = chroma_client.get_or_create_collection(collection_name)
 chat_memory = ChatMemoryBuffer(token_limit=2048)
 
 # -------------------------
-# 4. Document Ingestion, Transformation, and Metadata Storage
+# 4. Document Ingestion and Index Creation (Optimized)
 # -------------------------
-if collection.count() == 0:
-    print("No existing collection found. Extracting and indexing documents...")
+def process_document(doc):
+    """ Function to process a single document (Splitting & Extraction) """
+    text_splitter = SentenceSplitter(chunk_size=600, chunk_overlap=30)
 
-    # Load PDF documents from the 'data' directory recursively
-    documents = SimpleDirectoryReader(
-        input_dir="data",
-        required_exts=[".pdf"],
-        filename_as_id=True,
-        recursive=True
-    ).load_data()
-
-    print(f"Loaded {len(documents)} documents.")
-
-    # Define a robust text splitter for long documents
-    text_splitter = TokenTextSplitter(separator=' ', chunk_size=300, chunk_overlap=50)
-
-    # Define extractors for structured knowledge extraction
     extractors = [
         TitleExtractor(nodes=5),
         QuestionsAnsweredExtractor(questions=4),
@@ -59,123 +58,101 @@ if collection.count() == 0:
         KeywordExtractor(),
     ]
 
-    # Build a list of transformations that includes both splitting and extraction
-    transformations = [text_splitter] + extractors
+    pipeline = IngestionPipeline(transformations=[text_splitter] + extractors)
+    return pipeline.run([doc])
 
-    # Create the ingestion pipeline with the defined transformations
-    pipeline = IngestionPipeline(transformations=transformations)
 
-    # Process the documents into nodes that include text and metadata
-    nodes = pipeline.run(documents=documents)
+if collection.count() == 0:
+    print(f"{COLOR_CITATION}[INFO] No existing collection found. Extracting and indexing documents...{COLOR_RESET}")
 
-    # Create an index from the processed nodes for later retrieval (if needed)
+    # Load documents from directory
+    documents = SimpleDirectoryReader(
+        input_dir="data",
+        required_exts=[".pdf"],
+        filename_as_id=True,
+        recursive=True
+    ).load_data()
+
+    print(f"{COLOR_CITATION}[INFO] Loaded {len(documents)} documents.{COLOR_RESET}")
+
+    # **Parallel Processing with ThreadPoolExecutor**
+    nodes = []
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        results = list(tqdm(executor.map(process_document, documents), total=len(documents), desc="Processing Docs"))
+        for doc_nodes in results:
+            nodes.extend(doc_nodes)  # Collect nodes from all documents
+
+    # **Batch Embedding and Index Creation**
+    print(f"{COLOR_CITATION}[INFO] Generating embeddings & indexing...{COLOR_RESET}")
     index = VectorStoreIndex(nodes=nodes, show_progress=True)
 
-    # Store each node’s content along with its metadata in ChromaDB
+    # **Batch Store Documents in ChromaDB**
+    print(f"{COLOR_CITATION}[INFO] Storing documents in ChromaDB...{COLOR_RESET}")
+    doc_ids, doc_texts, doc_metadata = [], [], []
+
     for node in nodes:
         metadata = node.metadata
         filename = metadata.get("file_name", "Unknown File")
         page = metadata.get("page_label", "Unknown Page")
-        content = node.text
-        doc_id = str(uuid.uuid4())  # Unique document ID
 
-        collection.add(
-            ids=[doc_id],
-            documents=[content],
-            metadatas=[{"file_name": filename, "page_label": page}]
-        )
-        print(f"Stored: {filename} - Page {page}")
+        doc_ids.append(str(uuid.uuid4()))
+        doc_texts.append(node.text)
+        doc_metadata.append({"file_name": filename, "page_label": page})
+
+    collection.add(ids=doc_ids, documents=doc_texts, metadatas=doc_metadata)  # **Bulk insert**
+
+    print(f"{COLOR_CITATION}[INFO] Indexing complete. Future runs will load data from ChromaDB.{COLOR_RESET}")
+
 else:
-    print("Existing collection found. Skipping document extraction.")
+    print(f"{COLOR_CITATION}[INFO] Existing collection found. Loading index from ChromaDB...{COLOR_RESET}")
+    index = VectorStoreIndex.from_vector_store(vector_store)  # ✅ No re-processing
+
 
 # -------------------------
-# 5. System Prompt for Document-Based Responses
+# 5. Setup the Retriever and Chat Engine
 # -------------------------
-system_prompt = """
-You are an AI assistant designed strictly to answer document-related queries. Your operational rules:
-
-Casual greetings are allowed.
-
-You must only respond using the provided document excerpts. Hallucination of any kind is strictly prohibited.
-
-If the requested information is not present in the documents, respond with: "I don’t know."
-
-When retrieving information from a single source, cite it in this format: [Source: {file_name}, Page {page_label}].
-
-If multiple sources contain relevant information, include every source within the paragraph where the information appears. Do not place citations only at the end.
-
-Ensure accuracy and do not infer or generate information beyond what is explicitly stated in the documents.
-"""
+retriever = index.as_retriever()
+chat_engine = CondensePlusContextChatEngine.from_defaults(
+    llm=llm,
+    retriever=retriever,
+    memory=chat_memory  # Enables memory for better chat continuity
+)
 
 # -------------------------
-# 6. Retrieve Knowledge with Accurate Metadata
-# -------------------------
-def retrieve_knowledge(query):
-    # Query ChromaDB for the top 3 most relevant document segments
-    results = collection.query(query_texts=[query], n_results=5)
-    sources = []
-
-    # Iterate over the returned results
-    for doc_list, meta_list in zip(results["documents"], results["metadatas"]):
-        if not meta_list:
-            continue
-        meta = meta_list[0]  # We take the first metadata entry from the list
-        filename = meta.get("file_name", "Unknown File")
-        page = meta.get("page_label", "Unknown Page")
-        # Ensure we get the document text (first element if stored as a list)
-        content = doc_list[0]
-        sources.append((filename, page, content))
-    return sources
-
-# -------------------------
-# 7. Clean Retrieved Text
-# -------------------------
-def clean_text(text):
-    # Remove excess whitespace for better readability
-    return re.sub(r'\s+', ' ', text).strip()
-
-# -------------------------
-# 8. Chat Function with Precise Citations
+# 6. Interactive Chat Function
 # -------------------------
 def chat_with_proof(query):
-    print(f"\nUser: {query}")
-    sources = retrieve_knowledge(query)
+    response = chat_engine.stream_chat(query)  # Streaming response
 
-    if not sources:
-        print("AI: I'm sorry, but I can only answer questions related to the provided documents.")
-        return
+    print(f"{COLOR_AI}AI: {COLOR_RESET}", end="", flush=True)
+    for chunk in response.response_gen:
+        print(chunk, end="", flush=True)
 
-    # Build a response context from retrieved sources
-    response_context = ""
-    citation_details = []
-    for filename, page, excerpt in sources:
-        excerpt_clean = clean_text(excerpt[::])  # Use only the first 300 characters for context
-        response_context += f"{excerpt_clean}\n"
-        citation_details.append(f"[Source: {filename}, Page {page}]")
+    # Collect unique citations
+    unique_citations = set()
+    if response.source_nodes:
+        for node in response.source_nodes:
+            meta = node.metadata
+            file_name = meta.get("file_name", "Unknown File")
+            page_label = meta.get("page_label", "Unknown Page")
+            unique_citations.add(f"{file_name}, Page: {page_label}")
 
-    # Store the conversation in memory for context tracking
-    chat_memory.put({"query": query, "response": response_context})
-    
-    # Construct the prompt for the LLM using the retrieved context and the user query
-    prompt = f"{response_context}\n\nBased on this, answer the user's query: {query}"
-    generated_response = llm.complete(prompt)
-    
-    # Append citation details to the final response
-    citations = " ".join(citation_details)
-    final_response = f"{generated_response.text.strip()} {citations}"
-    
-    print("\nAI Response:")
-    print(final_response)
-    print("-" * 50)
+    # Print citations at the end (without duplicates)
+    if unique_citations:
+        print(f"\n\n{COLOR_CITATION}Citations:{COLOR_RESET}")
+        for citation in sorted(unique_citations):
+            print(f"{COLOR_CITATION}- {citation}{COLOR_RESET}")
+
+    print("\n" + "-" * 50)
 
 # -------------------------
-# 9. Interactive Q&A Session
+# 7. Start Interactive Chat Session
 # -------------------------
 if __name__ == "__main__":
-    print("Document Q&A System Initialized. Type 'exit' to quit.")
+    print(f"{COLOR_CITATION}Document Q&A System Initialized. Type 'exit' to quit.{COLOR_RESET}")
     while True:
-        user_query = input("\nYour question: ")
+        user_query = input(f"\n{COLOR_USER}Your question: {COLOR_RESET}")
         if user_query.lower() in ["exit", "quit", "bye"]:
-            print("Goodbye!")
+            print(f"{COLOR_CITATION}Goodbye!{COLOR_RESET}")
             break
         chat_with_proof(user_query)
