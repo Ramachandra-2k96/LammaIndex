@@ -10,6 +10,10 @@ from llama_index.core.extractors import TitleExtractor, QuestionsAnsweredExtract
 from llama_index.core.ingestion import IngestionPipeline
 from llama_index.core.chat_engine import CondensePlusContextChatEngine
 import chromadb
+from llama_index.extractors.entity import EntityExtractor
+
+import nltk
+nltk.download('punkt')
 
 # ANSI Color Codes for Terminal Output
 COLOR_USER = "\033[94m"     # Blue
@@ -20,11 +24,12 @@ COLOR_RESET = "\033[0m"     # Reset color
 # -------------------------
 # 1. Initialize AI Model & Embeddings
 # -------------------------
-llm = Ollama(model="llama3.2", request_timeout=600)
+pre_llm = Ollama(model="llama3.2", request_timeout=600)
+# normal_llm = Ollama(model="gemma3:latest", request_timeout=600)
 embed_model = OllamaEmbedding(model_name="nomic-embed-text")
 
 # Set global settings for LlamaIndex
-Settings.llm = llm
+Settings.llm = pre_llm
 Settings.embed_model = embed_model
 
 # -------------------------
@@ -57,18 +62,19 @@ if collection.count() == 0:
     print(f"{COLOR_CITATION}[INFO] Loaded {len(documents)} documents.{COLOR_RESET}")
 
     # Define a text splitter for long documents
-    text_splitter = SentenceSplitter(chunk_size=600, chunk_overlap=30)
 
     # Define extractors for structured knowledge extraction
     extractors = [
-        TitleExtractor(nodes=5),
+        SentenceSplitter(chunk_size=300, chunk_overlap=30),
+        TitleExtractor(nodes=7),
         QuestionsAnsweredExtractor(questions=4),
-        SummaryExtractor(summaries=["self"]),
-        KeywordExtractor(),
+        SummaryExtractor(summaries=["prev", "self"]),
+        KeywordExtractor(keywords=10),
+        EntityExtractor(prediction_threshold=0.5),
     ]
 
     # Create an ingestion pipeline
-    pipeline = IngestionPipeline(transformations=[text_splitter] + extractors)
+    pipeline = IngestionPipeline(transformations= extractors)
 
     # Process documents into nodes
     nodes = pipeline.run(documents=documents)
@@ -109,14 +115,23 @@ else:
     # Create the index from stored documents
     index = VectorStoreIndex.from_documents(nodes, show_progress=True)
 
+system_prompt = (
+    "You are an AI assistant that retrieves document-based information when necessary. "
+    "If no relevant information is found, reply: 'I don’t know.' "
+    "Also, determine if the query is factual or casual conversation: if factual, use Retrieval Augmented Generation (RAG); "
+    "if casual, answer directly without retrieval. "
+)
+
 # -------------------------
 # 5. Setup the Retriever and Chat Engine
 # -------------------------
-retriever = index.as_retriever()
+retriever = index.as_retriever(similarity_top_k=5, embed_model =embed_model)
+
 chat_engine = CondensePlusContextChatEngine.from_defaults(
-    llm=llm,
+    llm=pre_llm,
     retriever=retriever,
-    memory=chat_memory  # Enables memory for better chat continuity
+    memory=chat_memory,
+    system_prompt=system_prompt,
 )
 
 # -------------------------
@@ -145,6 +160,7 @@ def chat_with_proof(query):
             print(f"{COLOR_CITATION}- {citation}{COLOR_RESET}")
 
     print("\n" + "-" * 50)
+
 
 # -------------------------
 # 7. Start Interactive Chat Session
